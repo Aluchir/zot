@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	godigest "github.com/opencontainers/go-digest"
 	ispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -257,6 +258,96 @@ func TestRollbackDigestManifestTags(t *testing.T) {
 			sc := storage.StoreController{DefaultStore: &is}
 			rollbackDigestManifestTags(ctx, "repo", []string{"t"}, []string{"t"}, mediaType, dgst, body, sc,
 				metaDB, testLog, prior)
+		})
+	})
+}
+
+func TestReleaseIdleRepository(t *testing.T) {
+	Convey("releaseIdleRepository", t, func() {
+		logger := log.NewTestLogger()
+
+		Convey("A store failure is swallowed and keeps the meta record", func() {
+			metaDeleted := false
+			metaDB := mocks.MetaDBMock{
+				DeleteRepoMetaFn: func(repo string) error {
+					metaDeleted = true
+
+					return nil
+				},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+					return false, errHookInternal
+				},
+			}
+
+			So(func() { releaseIdleRepository("repo", imgStore, metaDB, logger) }, ShouldNotPanic)
+			So(metaDeleted, ShouldBeFalse)
+		})
+
+		Convey("The meta record goes only when the layout was removed", func() {
+			var gotRepo string
+
+			var gotAge time.Duration
+
+			var metaDeleted string
+
+			imgStore := mocks.MockedImageStore{
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+					gotRepo = repo
+					gotAge = maxBlobAge
+
+					return true, nil
+				},
+			}
+
+			metaDB := mocks.MetaDBMock{
+				DeleteRepoMetaFn: func(repo string) error {
+					metaDeleted = repo
+
+					return nil
+				},
+			}
+
+			releaseIdleRepository("repo", imgStore, metaDB, logger)
+			So(gotRepo, ShouldEqual, "repo")
+			So(gotAge, ShouldEqual, 0)
+			So(metaDeleted, ShouldEqual, "repo")
+		})
+
+		Convey("A kept layout keeps its meta record", func() {
+			metaDeleted := false
+			metaDB := mocks.MetaDBMock{
+				DeleteRepoMetaFn: func(repo string) error {
+					metaDeleted = true
+
+					return nil
+				},
+			}
+
+			imgStore := mocks.MockedImageStore{
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+					return false, nil
+				},
+			}
+
+			releaseIdleRepository("repo", imgStore, metaDB, logger)
+			So(metaDeleted, ShouldBeFalse)
+		})
+
+		Convey("A meta delete failure after layout removal is swallowed", func() {
+			imgStore := mocks.MockedImageStore{
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+					return true, nil
+				},
+			}
+
+			metaDB := mocks.MetaDBMock{
+				DeleteRepoMetaFn: func(repo string) error { return errHookInternal },
+			}
+
+			So(func() { releaseIdleRepository("repo", imgStore, metaDB, logger) }, ShouldNotPanic)
 		})
 	})
 }

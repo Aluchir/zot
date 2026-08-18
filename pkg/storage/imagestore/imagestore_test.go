@@ -1,14 +1,19 @@
 package imagestore_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"testing"
+	"time"
 
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	godigest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
+	ispec "github.com/opencontainers/image-spec/specs-go/v1"
 	. "github.com/smartystreets/goconvey/convey"
 
 	zerr "zotregistry.dev/zot/v2/errors"
@@ -17,6 +22,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/storage/gcs"
 	"zotregistry.dev/zot/v2/pkg/storage/imagestore"
 	"zotregistry.dev/zot/v2/pkg/storage/local"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 )
 
@@ -139,7 +145,7 @@ func TestCleanupRepoToleratesDeletePathNotFound(t *testing.T) {
 			return nil, nil
 		}
 
-		count, err := store.CleanupRepo(repo, []godigest.Digest{digest}, false)
+		count, err := store.CleanupRepo(repo, []godigest.Digest{digest})
 		So(err, ShouldBeNil)
 		So(count, ShouldEqual, 1)
 	})
@@ -183,8 +189,123 @@ func TestCleanupRepoFailsOnUnexpectedDeleteBlobError(t *testing.T) {
 			return nil, nil
 		}
 
-		count, err := store.CleanupRepo(repo, []godigest.Digest{digest}, false)
+		count, err := store.CleanupRepo(repo, []godigest.Digest{digest})
 		So(err, ShouldNotBeNil)
 		So(count, ShouldEqual, 0)
+	})
+}
+
+func TestRemoveIdleRepository(t *testing.T) {
+	newStore := func(rootDir string) storageTypes.ImageStore {
+		return imagestore.NewImageStore(rootDir, "", false, false, zlog.NewTestLogger(),
+			monitoring.NewNopMetricServer(), nil, local.New(true), nil, nil, nil)
+	}
+
+	removeIdle := func(store storageTypes.ImageStore, repo string, maxBlobAge time.Duration) (bool, error) {
+		var lockLatency time.Time
+
+		store.Lock(&lockLatency)
+		defer store.Unlock(&lockLatency)
+
+		return store.RemoveIdleRepository(repo, maxBlobAge)
+	}
+
+	Convey("An emptied repo loses its layout, orphan blobs included", t, func() {
+		rootDir := t.TempDir()
+		store := newStore(rootDir)
+		ctx := context.Background()
+
+		So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+		// an orphan blob, as left behind by a manifest delete
+		content := []byte("orphan blob")
+		digest := godigest.FromBytes(content)
+		_, _, err := store.FullBlobUpload(ctx, "repo", bytes.NewReader(content), digest)
+		So(err, ShouldBeNil)
+
+		removed, err := removeIdle(store, "repo", 0)
+		So(err, ShouldBeNil)
+		So(removed, ShouldBeTrue)
+		So(store.DirExists(path.Join(rootDir, "repo")), ShouldBeFalse)
+	})
+
+	Convey("A repo still holding a manifest is kept", t, func() {
+		rootDir := t.TempDir()
+		store := newStore(rootDir)
+		ctx := context.Background()
+
+		So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+		index := ispec.Index{
+			Versioned: specs.Versioned{SchemaVersion: 2},
+			Manifests: []ispec.Descriptor{{
+				MediaType: ispec.MediaTypeImageManifest,
+				Digest:    godigest.FromString("manifest"),
+				Size:      1,
+			}},
+		}
+		So(store.PutIndexContent("repo", index), ShouldBeNil)
+
+		removed, err := removeIdle(store, "repo", 0)
+		So(err, ShouldBeNil)
+		So(removed, ShouldBeFalse)
+		So(store.DirExists(path.Join(rootDir, "repo")), ShouldBeTrue)
+	})
+
+	Convey("A repo with a blob upload in progress is kept", t, func() {
+		rootDir := t.TempDir()
+		store := newStore(rootDir)
+		ctx := context.Background()
+
+		_, err := store.NewBlobUpload(ctx, "repo")
+		So(err, ShouldBeNil)
+
+		removed, err := removeIdle(store, "repo", 0)
+		So(err, ShouldBeNil)
+		So(removed, ShouldBeFalse)
+		So(store.DirExists(path.Join(rootDir, "repo")), ShouldBeTrue)
+	})
+
+	Convey("Blobs younger than maxBlobAge keep the repo", t, func() {
+		rootDir := t.TempDir()
+		store := newStore(rootDir)
+		ctx := context.Background()
+
+		So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+		content := []byte("young blob")
+		digest := godigest.FromBytes(content)
+		_, _, err := store.FullBlobUpload(ctx, "repo", bytes.NewReader(content), digest)
+		So(err, ShouldBeNil)
+
+		removed, err := removeIdle(store, "repo", time.Hour)
+		So(err, ShouldBeNil)
+		So(removed, ShouldBeFalse)
+		So(store.DirExists(path.Join(rootDir, "repo")), ShouldBeTrue)
+
+		ok, _, _, err := store.StatBlob("repo", digest)
+		So(err, ShouldBeNil)
+		So(ok, ShouldBeTrue)
+	})
+
+	Convey("A bare empty layout is removed", t, func() {
+		rootDir := t.TempDir()
+		store := newStore(rootDir)
+		ctx := context.Background()
+
+		So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+		removed, err := removeIdle(store, "repo", 0)
+		So(err, ShouldBeNil)
+		So(removed, ShouldBeTrue)
+		So(store.DirExists(path.Join(rootDir, "repo")), ShouldBeFalse)
+	})
+
+	Convey("A repo already gone from storage is a no-op", t, func() {
+		store := newStore(t.TempDir())
+
+		removed, err := removeIdle(store, "ghost", 0)
+		So(err, ShouldBeNil)
+		So(removed, ShouldBeFalse)
 	})
 }
