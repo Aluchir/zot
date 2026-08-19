@@ -3,8 +3,10 @@ package cache
 import (
 	"context"
 	goerrors "errors"
+	"math"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/go-redsync/redsync/v4"
 	gors "github.com/go-redsync/redsync/v4/redis/goredis/v9"
@@ -337,4 +339,71 @@ func (d *RedisDriver) DeleteBlob(digest godigest.Digest, path string) error {
 	}
 
 	return nil
+}
+
+// Ample for a manifest write. A gc sweep far exceeds it, which is why the lock
+// is extended while held rather than given a long expiry a crashed holder
+// would sit on. Variables, not constants, so tests can shrink them.
+//
+//nolint:gochecknoglobals // overridden by tests to exercise renewal
+var (
+	repoLockExpiry     = 30 * time.Second
+	repoLockRetryDelay = 250 * time.Millisecond
+)
+
+// LockRepo takes the cross-process lock for one repository. Its own key bucket
+// is deliberate: gc calls the metadata layer, which locks per repo too, while
+// holding this, and redsync mutexes are not reentrant.
+//
+// Acquisition is bounded by the caller's context, not by a try count: a sweep
+// holds the lock for minutes, and a push that gives up after seconds would fail
+// for the duration of every long collection. redsync still requires a finite
+// try count, so it is set effectively unbounded and the context is the deadline.
+func (d *RedisDriver) LockRepo(ctx context.Context, repo string) (func(), error) {
+	mutex := d.rs.NewMutex(
+		d.join(constants.RedisRepoLocksBucket, repo),
+		redsync.WithExpiry(repoLockExpiry),
+		redsync.WithTries(math.MaxInt32),
+		redsync.WithRetryDelay(repoLockRetryDelay),
+	)
+
+	if err := mutex.LockContext(ctx); err != nil {
+		d.log.Error().Err(err).Str("repo", repo).Msg("failed to acquire repo lock")
+
+		return nil, goerrors.Join(zerr.ErrRepoLockUnavailable, err)
+	}
+
+	// Extend while the work runs, or a sweep outlasts its own lock and a second
+	// writer starts on the same index.
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		ticker := time.NewTicker(repoLockExpiry / 3) //nolint:mnd // extend well before expiry
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if ok, err := mutex.Extend(); !ok || err != nil {
+					d.log.Warn().Err(err).Str("repo", repo).Msg("failed to extend repo lock")
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		// wait for a renewal already in flight, so Extend and Unlock never run
+		// on the same mutex concurrently
+		<-stopped
+
+		if _, err := mutex.Unlock(); err != nil {
+			d.log.Error().Err(err).Str("repo", repo).Msg("failed to release repo lock")
+		}
+	}, nil
 }

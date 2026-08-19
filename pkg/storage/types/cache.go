@@ -1,8 +1,19 @@
 package types
 
 import (
+	"context"
+
 	godigest "github.com/opencontainers/go-digest"
 )
+
+// RepoLocker serializes writes to one repository's index across processes.
+// The image store's own mutex covers a single process only, so instances
+// sharing a storage backend can otherwise overwrite each other's tags.
+type RepoLocker interface {
+	// LockRepo blocks until it holds the lock for repo or ctx is done, and
+	// returns the release. It errors rather than proceeding unlocked.
+	LockRepo(ctx context.Context, repo string) (func(), error)
+}
 
 type Cache interface {
 	// Returns the human-readable "name" of the driver.
