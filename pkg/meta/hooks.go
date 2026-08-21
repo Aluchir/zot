@@ -291,6 +291,19 @@ func OnDeleteManifest(repo, reference, mediaType string, digest godigest.Digest,
 // reclaims the orphan blobs the deletes left behind. Failures are logged, not returned: the
 // manifest delete already succeeded, and ParseStorage corrects a stale record on next start.
 func releaseIdleRepository(repo string, imgStore storageTypes.ImageStore, metaDB mTypes.MetaDB, log log.Logger) {
+	// The repo lock comes before the store lock, the order every index writer
+	// uses: without it a concurrent push on another instance could be mid-write
+	// on this repo's index while the layout is removed underneath it.
+	unlockRepo, err := imgStore.LockRepo(context.Background(), repo)
+	if err != nil {
+		log.Error().Err(err).Str("repository", repo).Str("component", "metadb").
+			Msg("failed to lock repo emptied by manifest deletes")
+
+		return
+	}
+
+	defer unlockRepo()
+
 	var lockLatency time.Time
 
 	imgStore.Lock(&lockLatency)
