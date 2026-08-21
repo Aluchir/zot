@@ -19,6 +19,7 @@ type MockedImageStore struct {
 	DirExistsFn           func(d string) bool
 	RootDirFn             func() string
 	InitRepoFn            func(ctx context.Context, name string) error
+	LockRepoFn            func(ctx context.Context, repo string) (func(), error)
 	ValidateRepoFn        func(name string) (bool, error)
 	GetRepositoriesFn     func() ([]string, error)
 	GetNextRepositoryFn   func(processedRepos map[string]struct{}) (string, error)
@@ -79,6 +80,14 @@ func (is MockedImageStore) StatIndex(repo string) (bool, int64, time.Time, error
 }
 
 func (is MockedImageStore) Lock(t *time.Time) {
+}
+
+func (is MockedImageStore) LockRepo(ctx context.Context, repo string) (func(), error) {
+	if is.LockRepoFn != nil {
+		return is.LockRepoFn(ctx, repo)
+	}
+
+	return func() {}, nil
 }
 
 func (is MockedImageStore) Unlock(t *time.Time) {

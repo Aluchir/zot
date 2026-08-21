@@ -139,6 +139,15 @@ func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 		return zerr.ErrRepoNotFound
 	}
 
+	// Rewrites the index like a push does, so it takes the same lock in the same
+	// order: before the store-wide one.
+	unlockRepo, err := gc.imgStore.LockRepo(ctx, repo)
+	if err != nil {
+		return err
+	}
+
+	defer unlockRepo()
+
 	gc.imgStore.Lock(&lockLatency)
 	defer gc.imgStore.Unlock(&lockLatency)
 

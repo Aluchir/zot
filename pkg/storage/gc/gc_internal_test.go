@@ -1900,6 +1900,23 @@ func TestGarbageCollectWithMockedImageStore(t *testing.T) {
 			So(errors.Is(err, zerr.ErrRepoNotFound), ShouldBeTrue)
 		})
 
+		Convey("CleanRepo fails when the repo lock is unavailable", func() {
+			imgStore := mocks.MockedImageStore{
+				DirExistsFn: func(d string) bool {
+					return true
+				},
+				LockRepoFn: func(ctx context.Context, repo string) (func(), error) {
+					return nil, errGC
+				},
+			}
+
+			gc := NewGarbageCollect(imgStore, mocks.MetaDBMock{}, gcOptions, audit, log, metrics)
+
+			err := gc.CleanRepo(ctx, repoName)
+			So(err, ShouldNotBeNil)
+			So(errors.Is(err, errGC), ShouldBeTrue)
+		})
+
 		Convey("removeStaleManifestEntries removes entries whose blobs are missing", func() {
 			existingDigest := godigest.FromString("existing-blob")
 			missingDigest := godigest.FromString("missing-blob")
