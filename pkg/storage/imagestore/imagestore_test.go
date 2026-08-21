@@ -197,6 +197,76 @@ func TestCleanupRepoFailsOnUnexpectedDeleteBlobError(t *testing.T) {
 	})
 }
 
+func TestInitRepoErrors(t *testing.T) {
+	Convey("InitRepo error paths", t, func() {
+		log := zlog.NewTestLogger()
+		metrics := monitoring.NewNopMetricServer()
+		ctx := context.Background()
+
+		Convey("rejects an invalid UTF-8 repo name", func() {
+			store := imagestore.NewImageStore(t.TempDir(), "", false, false, log, metrics, nil,
+				local.New(true), nil, nil, nil)
+
+			So(errors.Is(store.InitRepo(ctx, "\xff"), zerr.ErrInvalidRepositoryName), ShouldBeTrue)
+		})
+
+		Convey("rejects a repo name outside the distribution grammar", func() {
+			store := imagestore.NewImageStore(t.TempDir(), "", false, false, log, metrics, nil,
+				local.New(true), nil, nil, nil)
+
+			So(errors.Is(store.InitRepo(ctx, "INVALID??"), zerr.ErrInvalidRepositoryName), ShouldBeTrue)
+		})
+
+		Convey("fails when the repo directory cannot be created", func() {
+			rootDir := t.TempDir()
+
+			// a regular file where the repo's parent directory must be created
+			So(os.WriteFile(path.Join(rootDir, "repo"), []byte("file"), 0o600), ShouldBeNil)
+
+			store := imagestore.NewImageStore(rootDir, "", false, false, log, metrics, nil,
+				local.New(true), nil, nil, nil)
+
+			So(store.InitRepo(ctx, "repo"), ShouldNotBeNil)
+		})
+
+		Convey("fails when the oci-layout marker cannot be written", func() {
+			rootDir := t.TempDir()
+			repoDir := path.Join(rootDir, "repo")
+
+			// directories in place, but the repo dir is read-only, so the marker write fails
+			So(os.MkdirAll(path.Join(repoDir, "blobs", "sha256"), 0o755), ShouldBeNil)
+			So(os.MkdirAll(path.Join(repoDir, ".uploads"), 0o755), ShouldBeNil)
+			So(os.Chmod(repoDir, 0o555), ShouldBeNil)
+
+			t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+
+			store := imagestore.NewImageStore(rootDir, "", false, false, log, metrics, nil,
+				local.New(true), nil, nil, nil)
+
+			So(store.InitRepo(ctx, "repo"), ShouldNotBeNil)
+		})
+
+		Convey("fails when the index cannot be written", func() {
+			rootDir := t.TempDir()
+			repoDir := path.Join(rootDir, "repo")
+
+			// marker present, directories in place, read-only repo dir: the index write fails
+			So(os.MkdirAll(path.Join(repoDir, "blobs", "sha256"), 0o755), ShouldBeNil)
+			So(os.MkdirAll(path.Join(repoDir, ".uploads"), 0o755), ShouldBeNil)
+			So(os.WriteFile(path.Join(repoDir, "oci-layout"),
+				[]byte(`{"imageLayoutVersion":"1.0.0"}`), 0o600), ShouldBeNil)
+			So(os.Chmod(repoDir, 0o555), ShouldBeNil)
+
+			t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
+
+			store := imagestore.NewImageStore(rootDir, "", false, false, log, metrics, nil,
+				local.New(true), nil, nil, nil)
+
+			So(store.InitRepo(ctx, "repo"), ShouldNotBeNil)
+		})
+	})
+}
+
 func TestRemoveIdleRepository(t *testing.T) {
 	newStore := func(rootDir string) storageTypes.ImageStore {
 		return imagestore.NewImageStore(rootDir, "", false, false, zlog.NewTestLogger(),
@@ -211,7 +281,7 @@ func TestRemoveIdleRepository(t *testing.T) {
 		store.Lock(&lockLatency)
 		defer store.Unlock(&lockLatency)
 
-		return store.RemoveIdleRepository(repo, maxBlobAge, metaDB)
+		return store.RemoveIdleRepository(repo, maxBlobAge, metaDB, mocks.RepoLockMock{})
 	}
 
 	Convey("An emptied repo loses its layout and its meta record together", t, func() {
@@ -349,74 +419,23 @@ func TestRemoveIdleRepository(t *testing.T) {
 		So(err, ShouldBeNil)
 		So(removed, ShouldBeFalse)
 	})
-}
 
-func TestInitRepoErrors(t *testing.T) {
-	Convey("InitRepo error paths", t, func() {
-		log := zlog.NewTestLogger()
-		metrics := monitoring.NewNopMetricServer()
+	Convey("A lost repo lock fails the removal before the layout is deleted", t, func() {
+		rootDir := t.TempDir()
+		store := newStore(rootDir)
 		ctx := context.Background()
 
-		Convey("rejects an invalid UTF-8 repo name", func() {
-			store := imagestore.NewImageStore(t.TempDir(), "", false, false, log, metrics, nil,
-				local.New(true), nil, nil, nil)
+		So(store.InitRepo(ctx, "repo"), ShouldBeNil)
 
-			So(errors.Is(store.InitRepo(ctx, "\xff"), zerr.ErrInvalidRepositoryName), ShouldBeTrue)
-		})
+		var lockLatency time.Time
 
-		Convey("rejects a repo name outside the distribution grammar", func() {
-			store := imagestore.NewImageStore(t.TempDir(), "", false, false, log, metrics, nil,
-				local.New(true), nil, nil, nil)
+		store.Lock(&lockLatency)
+		defer store.Unlock(&lockLatency)
 
-			So(errors.Is(store.InitRepo(ctx, "INVALID??"), zerr.ErrInvalidRepositoryName), ShouldBeTrue)
-		})
-
-		Convey("fails when the repo directory cannot be created", func() {
-			rootDir := t.TempDir()
-
-			// a regular file where the repo's parent directory must be created
-			So(os.WriteFile(path.Join(rootDir, "repo"), []byte("file"), 0o600), ShouldBeNil)
-
-			store := imagestore.NewImageStore(rootDir, "", false, false, log, metrics, nil,
-				local.New(true), nil, nil, nil)
-
-			So(store.InitRepo(ctx, "repo"), ShouldNotBeNil)
-		})
-
-		Convey("fails when the oci-layout marker cannot be written", func() {
-			rootDir := t.TempDir()
-			repoDir := path.Join(rootDir, "repo")
-
-			// directories in place, but the repo dir is read-only, so the marker write fails
-			So(os.MkdirAll(path.Join(repoDir, "blobs", "sha256"), 0o755), ShouldBeNil)
-			So(os.MkdirAll(path.Join(repoDir, ".uploads"), 0o755), ShouldBeNil)
-			So(os.Chmod(repoDir, 0o555), ShouldBeNil)
-
-			t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
-
-			store := imagestore.NewImageStore(rootDir, "", false, false, log, metrics, nil,
-				local.New(true), nil, nil, nil)
-
-			So(store.InitRepo(ctx, "repo"), ShouldNotBeNil)
-		})
-
-		Convey("fails when the index cannot be written", func() {
-			rootDir := t.TempDir()
-			repoDir := path.Join(rootDir, "repo")
-
-			// marker present, directories in place, read-only repo dir: the index write fails
-			So(os.MkdirAll(path.Join(repoDir, "blobs", "sha256"), 0o755), ShouldBeNil)
-			So(os.MkdirAll(path.Join(repoDir, ".uploads"), 0o755), ShouldBeNil)
-			So(os.WriteFile(path.Join(repoDir, "oci-layout"),
-				[]byte(`{"imageLayoutVersion":"1.0.0"}`), 0o600), ShouldBeNil)
-			So(os.Chmod(repoDir, 0o555), ShouldBeNil)
-
-			t.Cleanup(func() { _ = os.Chmod(repoDir, 0o755) })
-
-			store := imagestore.NewImageStore(rootDir, "", false, false, log, metrics, nil,
-				local.New(true), nil, nil, nil)
-
-			So(store.InitRepo(ctx, "repo"), ShouldNotBeNil)
-		})
+		removed, err := store.RemoveIdleRepository("repo", 0, mocks.MetaDBMock{},
+			mocks.RepoLockMock{StillHeldFn: func(context.Context) bool { return false }})
+		So(err, ShouldNotBeNil)
+		So(removed, ShouldBeFalse)
+		So(store.DirExists(path.Join(rootDir, "repo")), ShouldBeTrue)
 	})
 }

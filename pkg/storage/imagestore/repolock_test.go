@@ -184,7 +184,7 @@ func TestRepoLockHeldByOtherStoreBlocksPush(t *testing.T) {
 		repo := "locked/repo"
 		body := pushTestManifest(t, stores[0], repo)
 
-		unlock, err := stores[0].LockRepo(ctx, repo)
+		heldLock, err := stores[0].LockRepo(ctx, repo)
 		So(err, ShouldBeNil)
 
 		pushCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
@@ -193,7 +193,7 @@ func TestRepoLockHeldByOtherStoreBlocksPush(t *testing.T) {
 		_, _, err = stores[1].PutImageManifest(pushCtx, repo, "t1", ispec.MediaTypeImageManifest, body, nil)
 		So(errors.Is(err, zerr.ErrRepoLockUnavailable), ShouldBeTrue)
 
-		unlock()
+		heldLock.Release()
 
 		_, _, err = stores[1].PutImageManifest(ctx, repo, "t1", ispec.MediaTypeImageManifest, body, nil)
 		So(err, ShouldBeNil)
@@ -210,8 +210,71 @@ type failLockCache struct {
 	mocks.CacheMock
 }
 
-func (failLockCache) LockRepo(context.Context, string) (func(), error) {
+func (failLockCache) LockRepo(context.Context, string) (storageTypes.RepoLock, error) {
 	return nil, zerr.ErrRepoLockUnavailable
+}
+
+// lostLockCache hands out locks that report themselves lost, simulating a holder that was stalled
+// past expiry and resumed after another instance took the lock.
+type lostLockCache struct {
+	mocks.CacheMock
+}
+
+func (lostLockCache) LockRepo(context.Context, string) (storageTypes.RepoLock, error) {
+	return mocks.RepoLockMock{StillHeldFn: func(context.Context) bool { return false }}, nil
+}
+
+// TestRepoLockLostFenceFailsCommit proves the fence before the index commit: a writer that lost
+// the repo lock mid-write fails instead of clobbering another instance's commit.
+func TestRepoLockLostFenceFailsCommit(t *testing.T) {
+	Convey("A push that lost the repo lock mid-write fails and writes nothing", t, func() {
+		rootDir := t.TempDir()
+		ctx := context.Background()
+
+		// the blob lands through a store with a working lock
+		goodStore := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+			zlog.NewMetricsServer(false, log.NewTestLogger()), nil, nil, nil, nil)
+
+		body := pushTestManifest(t, goodStore, "repo")
+
+		// the manifest push then goes through a store whose lock reports lost
+		store := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+			zlog.NewMetricsServer(false, log.NewTestLogger()), nil, lostLockCache{}, nil, nil)
+
+		_, _, err := store.PutImageManifest(ctx, "repo", "t1", ispec.MediaTypeImageManifest, body, nil)
+		So(errors.Is(err, zerr.ErrRepoLockUnavailable), ShouldBeTrue)
+
+		// the index was never committed
+		tags, err := goodStore.GetImageTags("repo")
+		So(err, ShouldBeNil)
+		So(tags, ShouldNotContain, "t1")
+	})
+
+	Convey("A delete that lost the repo lock mid-write fails before rewriting the index", t, func() {
+		rootDir := t.TempDir()
+		ctx := context.Background()
+
+		// write a manifest with a working lock first
+		goodStore := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+			zlog.NewMetricsServer(false, log.NewTestLogger()), nil, nil, nil, nil)
+
+		body := pushTestManifest(t, goodStore, "repo")
+
+		_, _, err := goodStore.PutImageManifest(ctx, "repo", "t1", ispec.MediaTypeImageManifest, body, nil)
+		So(err, ShouldBeNil)
+
+		// then delete through a store whose lock reports lost
+		store := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+			zlog.NewMetricsServer(false, log.NewTestLogger()), nil, lostLockCache{}, nil, nil)
+
+		err = store.DeleteImageManifest(ctx, "repo", "t1", false)
+		So(errors.Is(err, zerr.ErrRepoLockUnavailable), ShouldBeTrue)
+
+		// the tag survived
+		tags, err := goodStore.GetImageTags("repo")
+		So(err, ShouldBeNil)
+		So(tags, ShouldContain, "t1")
+	})
 }
 
 func TestRepoLockFailureFailsWrites(t *testing.T) {

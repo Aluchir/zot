@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redsync/redsync/v4"
@@ -16,6 +17,7 @@ import (
 	zerr "zotregistry.dev/zot/v2/errors"
 	zlog "zotregistry.dev/zot/v2/pkg/log"
 	"zotregistry.dev/zot/v2/pkg/storage/constants"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 )
 
 type RedisDriver struct {
@@ -359,7 +361,7 @@ var (
 // holds the lock for minutes, and a push that gives up after seconds would fail
 // for the duration of every long collection. redsync still requires a finite
 // try count, so it is set effectively unbounded and the context is the deadline.
-func (d *RedisDriver) LockRepo(ctx context.Context, repo string) (func(), error) {
+func (d *RedisDriver) LockRepo(ctx context.Context, repo string) (storageTypes.RepoLock, error) {
 	mutex := d.rs.NewMutex(
 		d.join(constants.RedisRepoLocksBucket, repo),
 		redsync.WithExpiry(repoLockExpiry),
@@ -373,37 +375,84 @@ func (d *RedisDriver) LockRepo(ctx context.Context, repo string) (func(), error)
 		return nil, goerrors.Join(zerr.ErrRepoLockUnavailable, err)
 	}
 
+	lock := &redisRepoLock{
+		mutex:   mutex,
+		log:     d.log,
+		repo:    repo,
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
+	}
+
 	// Extend while the work runs, or a sweep outlasts its own lock and a second
 	// writer starts on the same index.
-	done := make(chan struct{})
-	stopped := make(chan struct{})
-
 	go func() {
-		defer close(stopped)
+		defer close(lock.stopped)
 
 		ticker := time.NewTicker(repoLockExpiry / 3) //nolint:mnd // extend well before expiry
 		defer ticker.Stop()
 
 		for {
 			select {
-			case <-done:
+			case <-lock.done:
 				return
 			case <-ticker.C:
-				if ok, err := mutex.Extend(); !ok || err != nil {
-					d.log.Warn().Err(err).Str("repo", repo).Msg("failed to extend repo lock")
-				}
+				lock.extend()
 			}
 		}
 	}()
 
-	return func() {
-		close(done)
-		// wait for a renewal already in flight, so Extend and Unlock never run
-		// on the same mutex concurrently
-		<-stopped
+	return lock, nil
+}
 
-		if _, err := mutex.Unlock(); err != nil {
-			d.log.Error().Err(err).Str("repo", repo).Msg("failed to release repo lock")
-		}
-	}, nil
+// redisRepoLock serializes every redsync mutex operation: redsync mutexes are not
+// safe for concurrent use, and the renewal goroutine, StillHeld and Release would
+// otherwise race on them.
+type redisRepoLock struct {
+	mutex   *redsync.Mutex
+	log     zlog.Logger
+	repo    string
+	done    chan struct{}
+	stopped chan struct{}
+	mu      sync.Mutex
+}
+
+func (l *redisRepoLock) extend() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if ok, err := l.mutex.Extend(); !ok || err != nil {
+		l.log.Warn().Err(err).Str("repo", l.repo).Msg("failed to extend repo lock")
+	}
+}
+
+// StillHeld revalidates the fence token against the store, extending the lock on
+// success. A writer calls it immediately before committing, so a holder that lost
+// the lock (stalled past expiry, then resumed) fails its write instead of
+// clobbering the commit of whoever acquired the lock meanwhile.
+func (l *redisRepoLock) StillHeld(ctx context.Context) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	ok, err := l.mutex.ExtendContext(ctx)
+	if err != nil || !ok {
+		l.log.Warn().Err(err).Str("repo", l.repo).Msg("repo lock no longer held")
+
+		return false
+	}
+
+	return true
+}
+
+func (l *redisRepoLock) Release() {
+	close(l.done)
+	// wait for a renewal already in flight, so Extend and Unlock never run on the
+	// same mutex concurrently
+	<-l.stopped
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if _, err := l.mutex.Unlock(); err != nil {
+		l.log.Error().Err(err).Str("repo", l.repo).Msg("failed to release repo lock")
+	}
 }

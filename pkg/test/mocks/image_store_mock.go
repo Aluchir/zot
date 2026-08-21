@@ -19,7 +19,7 @@ type MockedImageStore struct {
 	DirExistsFn           func(d string) bool
 	RootDirFn             func() string
 	InitRepoFn            func(ctx context.Context, name string) error
-	LockRepoFn            func(ctx context.Context, repo string) (func(), error)
+	LockRepoFn            func(ctx context.Context, repo string) (storageTypes.RepoLock, error)
 	ValidateRepoFn        func(name string) (bool, error)
 	GetRepositoriesFn     func() ([]string, error)
 	GetNextRepositoryFn   func(processedRepos map[string]struct{}) (string, error)
@@ -59,10 +59,11 @@ type MockedImageStore struct {
 	RunDedupeBlobsFn     func(interval time.Duration, sch *scheduler.Scheduler)
 	RunDedupeForDigestFn func(ctx context.Context, digest godigest.Digest, dedupe bool,
 		duplicateBlobs []string) error
-	GetNextDigestWithBlobPathsFn  func(repos []string, lastDigests []godigest.Digest) (godigest.Digest, []string, error)
-	GetAllBlobsFn                 func(repo string) ([]godigest.Digest, error)
-	CleanupRepoFn                 func(repo string, blobs []godigest.Digest) (int, error)
-	RemoveIdleRepositoryFn        func(repo string, maxBlobAge time.Duration, metaDB mTypes.MetaDB) (bool, error)
+	GetNextDigestWithBlobPathsFn func(repos []string, lastDigests []godigest.Digest) (godigest.Digest, []string, error)
+	GetAllBlobsFn                func(repo string) ([]godigest.Digest, error)
+	CleanupRepoFn                func(repo string, blobs []godigest.Digest) (int, error)
+	RemoveIdleRepositoryFn       func(repo string, maxBlobAge time.Duration, metaDB mTypes.MetaDB,
+		repoLock storageTypes.RepoLock) (bool, error)
 	PutIndexContentFn             func(repo string, index ispec.Index) error
 	PopulateStorageMetricsFn      func(interval time.Duration, sch *scheduler.Scheduler)
 	StatIndexFn                   func(repo string) (bool, int64, time.Time, error)
@@ -82,12 +83,31 @@ func (is MockedImageStore) StatIndex(repo string) (bool, int64, time.Time, error
 func (is MockedImageStore) Lock(t *time.Time) {
 }
 
-func (is MockedImageStore) LockRepo(ctx context.Context, repo string) (func(), error) {
+func (is MockedImageStore) LockRepo(ctx context.Context, repo string) (storageTypes.RepoLock, error) {
 	if is.LockRepoFn != nil {
 		return is.LockRepoFn(ctx, repo)
 	}
 
-	return func() {}, nil
+	return RepoLockMock{}, nil
+}
+
+type RepoLockMock struct {
+	ReleaseFn   func()
+	StillHeldFn func(ctx context.Context) bool
+}
+
+func (m RepoLockMock) Release() {
+	if m.ReleaseFn != nil {
+		m.ReleaseFn()
+	}
+}
+
+func (m RepoLockMock) StillHeld(ctx context.Context) bool {
+	if m.StillHeldFn != nil {
+		return m.StillHeldFn(ctx)
+	}
+
+	return true
 }
 
 func (is MockedImageStore) Unlock(t *time.Time) {
@@ -464,10 +484,10 @@ func (is MockedImageStore) CleanupRepo(repo string, blobs []godigest.Digest) (in
 }
 
 func (is MockedImageStore) RemoveIdleRepository(repo string, maxBlobAge time.Duration,
-	metaDB mTypes.MetaDB,
+	metaDB mTypes.MetaDB, repoLock storageTypes.RepoLock,
 ) (bool, error) {
 	if is.RemoveIdleRepositoryFn != nil {
-		return is.RemoveIdleRepositoryFn(repo, maxBlobAge, metaDB)
+		return is.RemoveIdleRepositoryFn(repo, maxBlobAge, metaDB, repoLock)
 	}
 
 	return false, nil

@@ -38,7 +38,7 @@ func TestLockRepoMutualExclusion(t *testing.T) {
 
 		ctx := context.Background()
 
-		unlock, err := first.LockRepo(ctx, "repo")
+		lock, err := first.LockRepo(ctx, "repo")
 		So(err, ShouldBeNil)
 
 		waitCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
@@ -47,11 +47,11 @@ func TestLockRepoMutualExclusion(t *testing.T) {
 		_, err = second.LockRepo(waitCtx, "repo")
 		So(errors.Is(err, zerr.ErrRepoLockUnavailable), ShouldBeTrue)
 
-		unlock()
+		lock.Release()
 
-		unlockSecond, err := second.LockRepo(ctx, "repo")
+		lockSecond, err := second.LockRepo(ctx, "repo")
 		So(err, ShouldBeNil)
-		unlockSecond()
+		lockSecond.Release()
 	})
 
 	Convey("An already-canceled context fails acquisition immediately", t, func() {
@@ -83,7 +83,7 @@ func TestLockRepoRenewsWhileHeld(t *testing.T) {
 
 		ctx := context.Background()
 
-		unlock, err := first.LockRepo(ctx, "repo")
+		lock, err := first.LockRepo(ctx, "repo")
 		So(err, ShouldBeNil)
 
 		// well past the initial 600ms expiry; only the renewal can still be holding it
@@ -95,11 +95,39 @@ func TestLockRepoRenewsWhileHeld(t *testing.T) {
 		_, err = second.LockRepo(waitCtx, "repo")
 		So(errors.Is(err, zerr.ErrRepoLockUnavailable), ShouldBeTrue)
 
-		unlock()
+		lock.Release()
 
-		unlockSecond, err := second.LockRepo(ctx, "repo")
+		lockSecond, err := second.LockRepo(ctx, "repo")
 		So(err, ShouldBeNil)
-		unlockSecond()
+		lockSecond.Release()
+	})
+}
+
+func TestLockRepoStillHeld(t *testing.T) {
+	Convey("StillHeld validates the fence token", t, func() {
+		miniRedis := miniredis.RunT(t)
+		driver := newTestRedisDriver(t, miniRedis)
+
+		ctx := context.Background()
+
+		lock, err := driver.LockRepo(ctx, "repo")
+		So(err, ShouldBeNil)
+
+		Convey("is true while the lock is held", func() {
+			So(lock.StillHeld(ctx), ShouldBeTrue)
+			lock.Release()
+		})
+
+		Convey("is false once the lock is lost, so a stalled holder fails its commit", func() {
+			// simulate the lock expiring and being taken by someone else
+			miniRedis.Del("zot:repolocks:repo")
+
+			So(lock.StillHeld(ctx), ShouldBeFalse)
+
+			// Release must not panic or delete the new holder's key: redsync's
+			// unlock script only deletes when the token matches
+			So(func() { lock.Release() }, ShouldNotPanic)
+		})
 	})
 }
 
@@ -116,7 +144,7 @@ func TestLockRepoReleaseAfterRedisDown(t *testing.T) {
 		repoLockExpiry = 300 * time.Millisecond
 		repoLockRetryDelay = 50 * time.Millisecond
 
-		unlock, err := driver.LockRepo(context.Background(), "repo")
+		lock, err := driver.LockRepo(context.Background(), "repo")
 		So(err, ShouldBeNil)
 
 		miniRedis.Close()
@@ -124,6 +152,6 @@ func TestLockRepoReleaseAfterRedisDown(t *testing.T) {
 		// let a renewal tick run against the dead server, then release into it too
 		time.Sleep(300 * time.Millisecond)
 
-		So(func() { unlock() }, ShouldNotPanic)
+		So(func() { lock.Release() }, ShouldNotPanic)
 	})
 }

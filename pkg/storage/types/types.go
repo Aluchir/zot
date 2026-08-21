@@ -29,7 +29,7 @@ type ImageStore interface { //nolint:interfacebloat
 	RLock(*time.Time)
 	RUnlock(*time.Time)
 	Lock(*time.Time)
-	LockRepo(ctx context.Context, repo string) (func(), error)
+	LockRepo(ctx context.Context, repo string) (RepoLock, error)
 	Unlock(*time.Time)
 	InitRepo(ctx context.Context, name string) error
 	ValidateRepo(name string) (bool, error)
@@ -61,7 +61,7 @@ type ImageStore interface { //nolint:interfacebloat
 	) (io.ReadCloser, int64, int64, error)
 	DeleteBlob(repo string, digest godigest.Digest) error
 	CleanupRepo(repo string, blobs []godigest.Digest) (int, error)
-	RemoveIdleRepository(repo string, maxBlobAge time.Duration, metaDB mTypes.MetaDB) (bool, error)
+	RemoveIdleRepository(repo string, maxBlobAge time.Duration, metaDB mTypes.MetaDB, repoLock RepoLock) (bool, error)
 	GetIndexContent(repo string) ([]byte, error)
 	PutIndexContent(repo string, index ispec.Index) error
 	StatIndex(repo string) (bool, int64, time.Time, error)

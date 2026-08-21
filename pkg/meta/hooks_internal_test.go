@@ -15,6 +15,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/log"
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/storage"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	testimage "zotregistry.dev/zot/v2/pkg/test/image-utils"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 )
@@ -269,7 +270,7 @@ func TestReleaseIdleRepository(t *testing.T) {
 		Convey("A store failure is swallowed, since the manifest delete already succeeded", func() {
 			imgStore := mocks.MockedImageStore{
 				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration,
-					metaDB mTypes.MetaDB,
+					metaDB mTypes.MetaDB, repoLock storageTypes.RepoLock,
 				) (bool, error) {
 					return false, errHookInternal
 				},
@@ -285,7 +286,7 @@ func TestReleaseIdleRepository(t *testing.T) {
 
 			imgStore := mocks.MockedImageStore{
 				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration,
-					metaDB mTypes.MetaDB,
+					metaDB mTypes.MetaDB, repoLock storageTypes.RepoLock,
 				) (bool, error) {
 					gotRepo = repo
 					gotAge = maxBlobAge
