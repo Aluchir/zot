@@ -233,7 +233,7 @@ func (gc GarbageCollect) cleanRepo(ctx context.Context, repo string) error {
 		keep their grace period. This runs before deleteBlobUploads so that an upload not yet
 		old enough to be reaped still counts as in progress and keeps the repo, as
 		CleanupRepo's guard used to. */
-		removed, err := gc.imgStore.RemoveIdleRepository(repo, gc.opts.Delay)
+		removed, err := gc.imgStore.RemoveIdleRepository(repo, gc.opts.Delay, repoLock)
 		if err != nil {
 			gc.log.Error().Err(err).Str("module", "gc").Str("repository", repo).
 				Msg("failed to remove idle repo")

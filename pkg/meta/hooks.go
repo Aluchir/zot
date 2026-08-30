@@ -294,7 +294,7 @@ func releaseIdleRepository(repo string, imgStore storageTypes.ImageStore, metaDB
 	// The repo lock comes before the store lock, the order every index writer
 	// uses: without it a concurrent push on another instance could be mid-write
 	// on this repo's index while the layout is removed underneath it.
-	unlockRepo, err := imgStore.LockRepo(context.Background(), repo)
+	repoLock, err := imgStore.LockRepo(context.Background(), repo)
 	if err != nil {
 		log.Error().Err(err).Str("repository", repo).Str("component", "metadb").
 			Msg("failed to lock repo emptied by manifest deletes")
@@ -302,14 +302,14 @@ func releaseIdleRepository(repo string, imgStore storageTypes.ImageStore, metaDB
 		return
 	}
 
-	defer unlockRepo()
+	defer repoLock.Release()
 
 	var lockLatency time.Time
 
 	imgStore.Lock(&lockLatency)
 	defer imgStore.Unlock(&lockLatency)
 
-	removed, err := imgStore.RemoveIdleRepository(repo, 0)
+	removed, err := imgStore.RemoveIdleRepository(repo, 0, repoLock)
 	if err != nil {
 		log.Error().Err(err).Str("repository", repo).Str("component", "metadb").
 			Msg("failed to remove repo emptied by manifest deletes")

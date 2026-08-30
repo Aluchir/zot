@@ -759,7 +759,7 @@ func TestOnDeleteManifestWaitsForForeignRepoLock(t *testing.T) {
 		So(storeB.DeleteImageManifest(ctx, "repo", digest.String(), false), ShouldBeNil)
 
 		// another instance holds the repo lock, as a gc sweep or a push would
-		unlock, err := storeA.LockRepo(ctx, "repo")
+		heldLock, err := storeA.LockRepo(ctx, "repo")
 		So(err, ShouldBeNil)
 
 		done := make(chan error, 1)
@@ -776,7 +776,7 @@ func TestOnDeleteManifestWaitsForForeignRepoLock(t *testing.T) {
 		case <-time.After(300 * time.Millisecond):
 		}
 
-		unlock()
+		heldLock.Release()
 
 		So(<-done, ShouldBeNil)
 

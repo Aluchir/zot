@@ -208,7 +208,7 @@ func TestRemoveIdleRepository(t *testing.T) {
 		store.Lock(&lockLatency)
 		defer store.Unlock(&lockLatency)
 
-		return store.RemoveIdleRepository(repo, maxBlobAge)
+		return store.RemoveIdleRepository(repo, maxBlobAge, mocks.RepoLockMock{})
 	}
 
 	Convey("An emptied repo loses its layout, orphan blobs included", t, func() {
@@ -308,6 +308,25 @@ func TestRemoveIdleRepository(t *testing.T) {
 		removed, err := removeIdle(store, "ghost", 0)
 		So(err, ShouldBeNil)
 		So(removed, ShouldBeFalse)
+	})
+
+	Convey("A lost repo lock fails the removal before the layout is deleted", t, func() {
+		rootDir := t.TempDir()
+		store := newStore(rootDir)
+		ctx := context.Background()
+
+		So(store.InitRepo(ctx, "repo"), ShouldBeNil)
+
+		var lockLatency time.Time
+
+		store.Lock(&lockLatency)
+		defer store.Unlock(&lockLatency)
+
+		removed, err := store.RemoveIdleRepository("repo", 0,
+			mocks.RepoLockMock{StillHeldFn: func(context.Context) bool { return false }})
+		So(err, ShouldNotBeNil)
+		So(removed, ShouldBeFalse)
+		So(store.DirExists(path.Join(rootDir, "repo")), ShouldBeTrue)
 	})
 }
 

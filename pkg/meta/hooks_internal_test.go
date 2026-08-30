@@ -15,6 +15,7 @@ import (
 	"zotregistry.dev/zot/v2/pkg/log"
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
 	"zotregistry.dev/zot/v2/pkg/storage"
+	storageTypes "zotregistry.dev/zot/v2/pkg/storage/types"
 	testimage "zotregistry.dev/zot/v2/pkg/test/image-utils"
 	"zotregistry.dev/zot/v2/pkg/test/mocks"
 )
@@ -277,7 +278,7 @@ func TestReleaseIdleRepository(t *testing.T) {
 			}
 
 			imgStore := mocks.MockedImageStore{
-				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration, _ storageTypes.RepoLock) (bool, error) {
 					return false, errHookInternal
 				},
 			}
@@ -294,7 +295,7 @@ func TestReleaseIdleRepository(t *testing.T) {
 			var metaDeleted string
 
 			imgStore := mocks.MockedImageStore{
-				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration, _ storageTypes.RepoLock) (bool, error) {
 					gotRepo = repo
 					gotAge = maxBlobAge
 
@@ -327,7 +328,7 @@ func TestReleaseIdleRepository(t *testing.T) {
 			}
 
 			imgStore := mocks.MockedImageStore{
-				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration, _ storageTypes.RepoLock) (bool, error) {
 					return false, nil
 				},
 			}
@@ -338,7 +339,7 @@ func TestReleaseIdleRepository(t *testing.T) {
 
 		Convey("A meta delete failure after layout removal is swallowed", func() {
 			imgStore := mocks.MockedImageStore{
-				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration) (bool, error) {
+				RemoveIdleRepositoryFn: func(repo string, maxBlobAge time.Duration, _ storageTypes.RepoLock) (bool, error) {
 					return true, nil
 				},
 			}
