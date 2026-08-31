@@ -222,4 +222,5 @@ var (
 	ErrDisallowedMetricsPath            = errors.New("provided metrics path is disallowed")
 	ErrInvalidMetricsPathPrefix         = errors.New("metrics path must start with /")
 	ErrInvalidMetricsPath               = errors.New("invalid metrics path")
+	ErrBlobRefIndexUnavailable          = errors.New("blob reference index is unavailable")
 )
