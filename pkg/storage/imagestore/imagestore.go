@@ -2463,6 +2463,24 @@ func (is *ImageStore) StatBlob(repo string, digest godigest.Digest) (bool, int64
 	return true, binfo.Size(), binfo.ModTime(), nil
 }
 
+// globalBlobPathIfPresent returns the global blobstore path for digest when this store
+// keeps payloads centrally (remote shared storage) and that object actually exists.
+// Local storage returns ErrBlobNotFound unconditionally: there each repository holds a
+// real hardlink, so a repository path is itself a physical location and the global copy
+// is not the single source of truth the way it is remotely.
+func (is *ImageStore) globalBlobPathIfPresent(digest godigest.Digest) (string, error) {
+	if !is.lifecycle.UsesLogicalRepoRefs() {
+		return "", zerr.ErrBlobNotFound
+	}
+
+	globalBlobPath := is.BlobPath(storageConstants.GlobalBlobsRepo, digest)
+	if _, err := is.storeDriver.Stat(globalBlobPath); err != nil {
+		return "", zerr.ErrBlobNotFound
+	}
+
+	return globalBlobPath, nil
+}
+
 func (is *ImageStore) checkCacheBlob(digest godigest.Digest) (string, error) {
 	if err := digest.Validate(); err != nil {
 		return "", err
@@ -2480,6 +2498,24 @@ func (is *ImageStore) checkCacheBlob(digest godigest.Digest) (string, error) {
 	dstRecord = is.absCacheRecordPath(dstRecord)
 
 	if _, err := is.storeDriver.Stat(dstRecord); err != nil {
+		// On remote shared storage a per-repository cache record is a logical ownership
+		// marker with no object of its own once the payload lives in the global
+		// blobstore, so a missing object at that path is the normal state, not evidence
+		// that the record is stale. A cache carried over from a pre-blobstore release
+		// hits this on every read right after upgradeToGlobalBlobstore runs: its
+		// "original" record for a digest is the repository path the payload was promoted
+		// from, and the upgrade deletes exactly that object. Resolve to the global
+		// payload instead of pruning a still-valid ownership reference, which would also
+		// hide the digest from GetAllBlobs - the enumeration garbage collection consults
+		// to decide which manifests are stale and which blobs are unreferenced.
+		if globalBlobPath, globalErr := is.globalBlobPathIfPresent(digest); globalErr == nil {
+			is.log.Debug().Str("digest", digest.String()).Str("dstRecord", dstRecord).
+				Str("globalBlobPath", globalBlobPath).Str("component", "cache").
+				Msg("cache record has no object of its own, resolving to the global blobstore")
+
+			return globalBlobPath, nil
+		}
+
 		is.log.Error().Err(err).Str("blob", dstRecord).Msg("failed to stat blob")
 
 		// the actual blob on disk may have been removed by GC, so sync the blob refs
