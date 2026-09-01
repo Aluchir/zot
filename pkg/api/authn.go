@@ -231,8 +231,13 @@ func (amw *AuthnMiddleware) basicAuthn(ctlr *Controller, userAc *reqCtx.UserAcce
 		return true, nil
 	}
 
+	// an ldap section enabled by a config reload has no client built at startup
+	if authConfig.IsLdapAuthEnabled() && amw.ldapClient == nil {
+		ctlr.Log.Warn().Msg("ldap auth enabled by config reload requires a restart to take effect")
+	}
+
 	// next, LDAP if configured (network-based which can lose connectivity)
-	if authConfig.IsLdapAuthEnabled() {
+	if authConfig.IsLdapAuthEnabled() && amw.ldapClient != nil {
 		ok, _, ldapgroups, err := amw.ldapClient.Authenticate(identity, passphrase)
 		if ok && err == nil {
 			// Process request
