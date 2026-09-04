@@ -47,7 +47,7 @@ type Controller struct {
 	Audit           *log.Logger
 	Server          *http.Server
 	Metrics         monitoring.MetricServer
-	EventRecorder   events.Recorder
+	EventRecorder   *events.ReloadableRecorder
 	CveScanner      ext.CveScanner
 	SyncOnDemand    ext.SyncOnDemand
 	RelyingParties  map[string]rp.RelyingParty
@@ -448,12 +448,39 @@ func (c *Controller) InitEventRecorder() error {
 		return err
 	}
 
-	c.EventRecorder = eventRecorder
+	// wrapped even when events are disabled, so a reload that enables them has
+	// something to swap into
+	c.EventRecorder = events.NewReloadableRecorder(eventRecorder)
 
 	return nil
 }
 
+// reloadEventRecorder rebuilds the recorder when the events config changed, so new
+// sinks, URLs and credentials take effect. Its sinks are live connections, hence a
+// rebuild rather than a re-read, and only when the config actually moved.
+func (c *Controller) reloadEventRecorder(previousFingerprint string) {
+	if c.EventRecorder == nil || previousFingerprint == c.Config.EventsFingerprint() {
+		return
+	}
+
+	eventRecorder, err := ext.NewEventRecorder(c.Config, c.Log)
+	if err != nil && !goerrors.Is(err, errors.ErrExtensionNotEnabled) {
+		c.Log.Error().Err(err).Msg("failed to rebuild event recorder, keeping the previous one")
+
+		return
+	}
+
+	if replaced := c.EventRecorder.Swap(eventRecorder); replaced != nil {
+		replaced.Close()
+	}
+
+	c.Log.Info().Bool("enabled", eventRecorder != nil).Msg("reloaded event recorder")
+}
+
 func (c *Controller) LoadNewConfig(newConfig *config.Config) {
+	// taken before the update, to tell whether the events config moved
+	previousEventsFingerprint := c.Config.EventsFingerprint()
+
 	// Update only reloadable config fields atomically
 	c.Config.UpdateReloadableConfig(newConfig)
 
@@ -482,6 +509,8 @@ func (c *Controller) LoadNewConfig(newConfig *config.Config) {
 		c.LDAPClient.BindPassword = authConfig.LDAP.BindPassword()
 		c.LDAPClient.lock.Unlock()
 	}
+
+	c.reloadEventRecorder(previousEventsFingerprint)
 
 	c.InitCVEInfo()
 

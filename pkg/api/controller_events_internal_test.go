@@ -1,0 +1,168 @@
+//go:build events
+
+package api
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+	cehttp "github.com/cloudevents/sdk-go/v2/protocol/http"
+	. "github.com/smartystreets/goconvey/convey"
+
+	"zotregistry.dev/zot/v2/pkg/api/config"
+	extconf "zotregistry.dev/zot/v2/pkg/extensions/config"
+	eventsconf "zotregistry.dev/zot/v2/pkg/extensions/config/events"
+	"zotregistry.dev/zot/v2/pkg/extensions/monitoring"
+	"zotregistry.dev/zot/v2/pkg/log"
+	"zotregistry.dev/zot/v2/pkg/storage"
+)
+
+// eventSink is a receiving endpoint standing in for a webhook.
+func eventSink(t *testing.T) (string, chan *cloudevents.Event) {
+	t.Helper()
+
+	received := make(chan *cloudevents.Event, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		event, err := cehttp.NewEventFromHTTPRequest(req)
+		if err != nil {
+			resp.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+
+		received <- event
+		resp.WriteHeader(http.StatusOK)
+	}))
+
+	t.Cleanup(server.Close)
+
+	return server.URL, received
+}
+
+func eventsConfig(address string) *config.Config {
+	enabled := true
+	cfg := config.New()
+	cfg.Extensions = &extconf.ExtensionConfig{}
+
+	if address != "" {
+		cfg.Extensions.Events = &eventsconf.Config{
+			Enable: &enabled,
+			Sinks: []eventsconf.SinkConfig{{
+				Type:    eventsconf.HTTP,
+				Address: address,
+				Timeout: 5 * time.Second,
+			}},
+		}
+	}
+
+	return cfg
+}
+
+func awaitEvent(received chan *cloudevents.Event) *cloudevents.Event {
+	select {
+	case event := <-received:
+		return event
+	case <-time.After(5 * time.Second):
+		return nil
+	}
+}
+
+func TestEventRecorderReload(t *testing.T) {
+	Convey("A changed events config re-points the recorder without a restart", t, func() {
+		firstURL, firstSink := eventSink(t)
+		secondURL, secondSink := eventSink(t)
+
+		ctlr := NewController(eventsConfig(firstURL))
+		ctlr.Log = log.NewTestLogger()
+		So(ctlr.InitEventRecorder(), ShouldBeNil)
+
+		ctlr.EventRecorder.RepositoryCreated("repo", nil)
+		So(awaitEvent(firstSink), ShouldNotBeNil)
+
+		// the full reload path, not just the recorder helper
+		ctlr.LoadNewConfig(eventsConfig(secondURL))
+
+		ctlr.EventRecorder.RepositoryCreated("repo", nil)
+		So(awaitEvent(secondSink), ShouldNotBeNil)
+		So(len(firstSink), ShouldEqual, 0)
+	})
+
+	Convey("Events enabled by a reload start being delivered", t, func() {
+		sinkURL, sink := eventSink(t)
+
+		ctlr := NewController(eventsConfig(""))
+		ctlr.Log = log.NewTestLogger()
+		So(ctlr.InitEventRecorder(), ShouldBeNil)
+
+		// nothing to publish to yet, and publishing must still be safe
+		ctlr.EventRecorder.RepositoryCreated("repo", nil)
+
+		ctlr.LoadNewConfig(eventsConfig(sinkURL))
+
+		ctlr.EventRecorder.RepositoryCreated("repo", nil)
+		So(awaitEvent(sink), ShouldNotBeNil)
+	})
+
+	Convey("Events disabled by a reload stop being delivered", t, func() {
+		sinkURL, sink := eventSink(t)
+
+		ctlr := NewController(eventsConfig(sinkURL))
+		ctlr.Log = log.NewTestLogger()
+		So(ctlr.InitEventRecorder(), ShouldBeNil)
+
+		ctlr.EventRecorder.RepositoryCreated("repo", nil)
+		So(awaitEvent(sink), ShouldNotBeNil)
+
+		ctlr.LoadNewConfig(eventsConfig(""))
+
+		ctlr.EventRecorder.RepositoryCreated("repo", nil)
+		So(len(sink), ShouldEqual, 0)
+	})
+
+	Convey("An unchanged events config keeps the same recorder", t, func() {
+		sinkURL, sink := eventSink(t)
+
+		ctlr := NewController(eventsConfig(sinkURL))
+		ctlr.Log = log.NewTestLogger()
+		So(ctlr.InitEventRecorder(), ShouldBeNil)
+
+		ctlr.LoadNewConfig(eventsConfig(sinkURL))
+
+		// the sinks were not torn down, so delivery still works
+		ctlr.EventRecorder.RepositoryCreated("repo", nil)
+		So(awaitEvent(sink), ShouldNotBeNil)
+	})
+}
+
+func TestEventRecorderReloadReachesImageStores(t *testing.T) {
+	Convey("A swap reaches the stores the recorder was handed to at startup", t, func() {
+		firstURL, firstSink := eventSink(t)
+		secondURL, secondSink := eventSink(t)
+
+		conf := eventsConfig(firstURL)
+		conf.Storage.RootDirectory = t.TempDir()
+
+		ctlr := NewController(conf)
+		ctlr.Log = log.NewTestLogger()
+		So(ctlr.InitEventRecorder(), ShouldBeNil)
+
+		// the stores are handed the recorder once, exactly as Init does
+		storeController, err := storage.New(ctlr.Config, nil, monitoring.NewNopMetricServer(),
+			ctlr.Log, ctlr.EventRecorder)
+		So(err, ShouldBeNil)
+
+		store := storeController.GetDefaultImageStore()
+		So(store.InitRepo(context.Background(), "before"), ShouldBeNil)
+		So(awaitEvent(firstSink), ShouldNotBeNil)
+
+		ctlr.LoadNewConfig(eventsConfig(secondURL))
+
+		So(store.InitRepo(context.Background(), "after"), ShouldBeNil)
+		So(awaitEvent(secondSink), ShouldNotBeNil)
+		So(len(firstSink), ShouldEqual, 0)
+	})
+}
